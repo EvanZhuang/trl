@@ -363,7 +363,7 @@ def _backward_kernel(
     s_ptrs = s_ptr + row * s_stride + offsets
     y = tl.load(s_ptrs, mask=mask, other=0.0).to(tl.float32) * s_scale
     if S_HAS_SOFTCAP:
-        th = 2 * tl.sigmoid(2 * y / s_softcap) - 1
+        th = libdevice.tanh(y * tl.div_rn(1.0, s_softcap))
         zs = s_softcap * th * inv_t
     else:
         zs = y * inv_t
