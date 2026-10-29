@@ -85,19 +85,24 @@ def _gather_ids(tile: torch.Tensor, ids: torch.Tensor, vocab_start: int) -> tupl
     local = ids - vocab_start
     in_tile = (local >= 0) & (local < width)
     local = local.clamp(0, width - 1)
-    return tile.gather(1, local).float(), local, in_tile
+    return tile.gather(1, local), local, in_tile
 
 
 @_jit
 def _transform(z, logit_scale, softcap, inv_t, HAS_SOFTCAP: tl.constexpr):
     # Before torch 2.15, torch.compile passes Python float arguments as fp64; keep the math in fp32
+    # Round each op back to the tile dtype so bf16/fp16 tiles match the model's forward and vLLM's sampler
+    dtype: tl.constexpr = z.dtype
+    z = z.to(tl.float32)
     logit_scale = tl.cast(logit_scale, tl.float32)
     softcap = tl.cast(softcap, tl.float32)
     inv_t = tl.cast(inv_t, tl.float32)
-    z = z * logit_scale
+    z = (z * logit_scale).to(dtype).to(tl.float32)
     if HAS_SOFTCAP:
-        # tanh(x) = 2 * sigmoid(2x) - 1
-        z = softcap * (2 * tl.sigmoid(2 * z / softcap) - 1)
+        inv_softcap = tl.div_rn(1.0, softcap)
+        x = (z * inv_softcap).to(dtype).to(tl.float32)
+        t = libdevice.tanh(x).to(dtype).to(tl.float32)
+        z = (softcap * t).to(dtype).to(tl.float32)
     return z * inv_t
 
 
@@ -155,7 +160,7 @@ def _forward_kernel(
     for start in range(0, n_cols, BLOCK_SIZE):
         offsets = start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_cols
-        z = tl.load(row_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        z = tl.load(row_ptr + offsets, mask=mask, other=0.0)
         z = _transform(z, logit_scale, softcap, inv_t, HAS_SOFTCAP)
         if HAS_MEAN_LOGITS:
             zs += tl.sum(tl.where(mask, z, 0.0), axis=0)
@@ -214,7 +219,7 @@ def _forward_kernel(
         tl.store(max_before_target_ptr + row, max_before_target)
 
     if (local >= 0) & (local < n_cols):
-        z = tl.load(row_ptr + local).to(tl.float32)
+        z = tl.load(row_ptr + local)
         tl.store(target_logit_ptr + row, _transform(z, logit_scale, softcap, inv_t, HAS_SOFTCAP))
 
 
@@ -253,14 +258,17 @@ def _backward_kernel(
     logit_scale = tl.cast(logit_scale, tl.float32)
     softcap = tl.cast(softcap, tl.float32)
     inv_t = tl.cast(inv_t, tl.float32)
+    dtype: tl.constexpr = mm_ptr.dtype.element_ty
     row = tl.program_id(0).to(tl.int64)
     offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_cols
     ptrs = mm_ptr + row * mm_stride + offsets
-    y = tl.load(ptrs, mask=mask, other=0.0).to(tl.float32) * logit_scale
+    y = (tl.load(ptrs, mask=mask, other=0.0).to(tl.float32) * logit_scale).to(dtype).to(tl.float32)
     if HAS_SOFTCAP:
-        t = 2 * tl.sigmoid(2 * y / softcap) - 1
-        z = softcap * t * inv_t
+        inv_softcap = tl.div_rn(1.0, softcap)
+        x = (y * inv_softcap).to(dtype).to(tl.float32)
+        t = libdevice.tanh(x).to(dtype).to(tl.float32)
+        z = (softcap * t).to(dtype).to(tl.float32) * inv_t
     else:
         z = y * inv_t
     log_p = z - tl.load(log_z_ptr + row)
@@ -304,7 +312,7 @@ def _torch_transform(z, logit_scale, softcap, inv_t, HAS_SOFTCAP):
     z = z * logit_scale
     if HAS_SOFTCAP:
         z = softcap * torch.tanh(z / softcap)
-    return z * inv_t
+    return z.float() * inv_t
 
 
 def _forward_tile(
@@ -341,7 +349,7 @@ def _forward_tile(
     BLOCK_SIZE,
 ):
     # `_forward_kernel` in torch, for devices without Triton: the whole tile at once instead of one program per token
-    z = _torch_transform(tile.float(), logit_scale, softcap, inv_t, HAS_SOFTCAP)
+    z = _torch_transform(tile, logit_scale, softcap, inv_t, HAS_SOFTCAP)
     local = targets - vocab_start
     if HAS_MEAN_LOGITS:
         z_sum += z.sum(-1)
@@ -416,12 +424,13 @@ def _backward_tile(
     BLOCK_SIZE,
 ):
     # `_backward_kernel` in torch, for devices without Triton: the whole tile at once instead of one block per program
-    y = tile.float() * logit_scale
+    y = tile * logit_scale
     if HAS_SOFTCAP:
         t = torch.tanh(y / softcap)
-        z = softcap * t * inv_t
+        z = (softcap * t).float() * inv_t
+        t = t.float()
     else:
-        z = y * inv_t
+        z = y.float() * inv_t
     log_p = z - log_z.unsqueeze(-1)
     p = torch.exp(log_p)
 
@@ -672,9 +681,10 @@ class ChunkedLogProbFunction(torch.autograd.Function):
                     if grad_score is not None:
                         y, local, in_tile = _gather_ids(tile, score_ids[token_start:token_end], start)
                         y = y * ctx.logit_scale
-                        chain = torch.full_like(y, ctx.logit_scale / ctx.temperature)
+                        chain = torch.full_like(y, ctx.logit_scale / ctx.temperature, dtype=torch.float32)
                         if ctx.softcap is not None:
-                            chain = chain * (1 - torch.tanh(y / ctx.softcap) ** 2)
+                            t = torch.tanh(y / ctx.softcap).float()
+                            chain = chain * (1 - t * t)
                         sparse_grad = grad_score[token_start:token_end] * chain * in_tile
                     fold = (
                         _backward_kernel[(n, triton.cdiv(end - start, _BLOCK_SIZE))]

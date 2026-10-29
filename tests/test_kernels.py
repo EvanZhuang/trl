@@ -168,10 +168,10 @@ class TestChunkedLogProbFunction:
         logits = hidden @ weight.t()
         if bias is not None:
             logits = logits + bias
-        logits = logits.to(torch.float32) * logit_scale
+        logits = logits * logit_scale
         if final_logit_softcapping is not None:
             logits = torch.tanh(logits / final_logit_softcapping) * final_logit_softcapping
-        logits = logits / temperature  # [N, V]
+        logits = logits.to(torch.float32) / temperature  # [N, V]
         log_p = F.log_softmax(logits, dim=-1)
         logprobs = log_p.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
         p = torch.softmax(logits, dim=-1)
@@ -301,18 +301,21 @@ class TestChunkedLogProbFunction:
 
     # CPU tensors stand in for an accelerator without Triton (e.g. Trainium): TRL does not target CPU training
     @pytest.mark.parametrize("device", [torch_device, "cpu"])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize(
         ("logit_scale", "final_logit_softcapping"),
         [
             (0.5, None),  # models that scale but don't softcap, e.g. MPT
+            (1.0 / 6.0, None),  # non-power-of-two logit_scale, e.g. Granite logits_scaling=6
             (1.0, 30.0),  # models that softcap but don't scale, e.g. Gemma 2
             (0.5, 30.0),  # both, applied in that order
+            (1.0 / 6.0, 30.0),  # both with a non-power-of-two scale
         ],
     )
-    def test_logit_scale_and_softcapping(self, device, logit_scale, final_logit_softcapping):
+    def test_logit_scale_and_softcapping(self, device, dtype, logit_scale, final_logit_softcapping):
         torch.manual_seed(42)
-        hidden = torch.randn(self.N, self.H, device=device)
-        weight = torch.randn(self.V, self.H, device=device)
+        hidden = torch.randn(self.N, self.H, device=device, dtype=dtype)
+        weight = torch.randn(self.V, self.H, device=device, dtype=dtype)
         labels = torch.randint(0, self.V, (self.N,), device=device)
 
         logprobs, entropy, *_ = ChunkedLogProbFunction.apply(
