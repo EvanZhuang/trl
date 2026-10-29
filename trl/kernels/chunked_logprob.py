@@ -165,10 +165,12 @@ def _forward_kernel(
             max_before_target = tl.maximum(
                 max_before_target, tl.max(tl.where(offsets < local, z, -float("inf")), axis=0)
             )
-        new_m = tl.maximum(m, tl.max(z, axis=0))
+        row_tile_max = tl.max(z, axis=0)
+        new_m = tl.maximum(m, row_tile_max)
         rescale = tl.exp(m - new_m)
         e = tl.where(mask, tl.exp(z - new_m), 0.0)
-        s = s * rescale + tl.sum(e, axis=0)
+        row_tile_argmax = tl.min(tl.where(mask & (z == row_tile_max), offsets, 2147483647), axis=0)
+        tile_sum = tl.sum(tl.where((m < row_tile_max) & (offsets == row_tile_argmax), 0.0, e), axis=0)
         other_e = tl.where(offsets != local, e, 0.0)
         os = os * rescale + tl.sum(other_e, axis=0)
         if HAS_SUPPORT:
@@ -190,7 +192,9 @@ def _forward_kernel(
             si = tl.where(sm < tile_max, vocab_start + tile_argmax, si)
             sm = new_sm
         if HAS_ENTROPY:
-            xs = xs * rescale + tl.sum(e * tl.where(mask, z, 0.0), axis=0)
+            shift = tl.where(m == -float("inf"), 0.0, m - new_m)
+            xs = (xs + (1 + s) * shift) * rescale + tl.sum(e * tl.where(mask, z - new_m, 0.0), axis=0)
+        s = s * rescale + tl.where(m < row_tile_max, rescale, 0.0) + tile_sum
         if HAS_LOG_SUM_SQ_PROBS:
             sq = sq * rescale * rescale + tl.sum(e * e, axis=0)
         m = new_m
@@ -223,10 +227,11 @@ def _backward_kernel(
     mm_ptr,
     mm_stride,
     targets_ptr,
+    running_max_ptr,
     log_z_ptr,
     support_log_z_ptr,
     logprobs_ptr,
-    entropy_ptr,
+    centered_logit_ptr,
     grad_logprobs_ptr,
     grad_entropy_ptr,
     score_max_ptr,
@@ -263,7 +268,8 @@ def _backward_kernel(
         z = softcap * t * inv_t
     else:
         z = y * inv_t
-    log_p = z - tl.load(log_z_ptr + row)
+    shifted = z - tl.load(running_max_ptr + row)
+    log_p = shifted - tl.load(log_z_ptr + row)
     p = tl.exp(log_p)
 
     grad = tl.zeros((BLOCK_SIZE,), tl.float32)
@@ -290,9 +296,9 @@ def _backward_kernel(
         max_grad = -tl.load(grad_score_other_ptr + row) - g * libdevice.expm1(-score_log_z)
         grad += tl.where(is_max, max_grad, -g * q)
     if HAS_ENTROPY_GRAD:
-        # d(entropy) / dz_j = -p_j * (log p_j + entropy)
+        # d(entropy) / dz_j = -p_j * (log p_j + entropy) = -p_j * ((z_j - m) - E[z - m])
         g = tl.load(grad_entropy_ptr + row)
-        grad -= g * p * (log_p + tl.load(entropy_ptr + row))
+        grad -= g * p * (shifted - tl.load(centered_logit_ptr + row))
     grad = grad * inv_t
     if HAS_SOFTCAP:
         grad = grad * (1 - t * t)
@@ -349,10 +355,22 @@ def _forward_tile(
         # `argmax` returns the first maximum, so a tie with an earlier token does not count as a top-1 prediction
         before_target = torch.arange(n_cols, device=z.device) < local.unsqueeze(-1)
         max_before_target.copy_(torch.maximum(max_before_target, z.masked_fill(~before_target, -math.inf).amax(-1)))
-    new_m = torch.maximum(running_max, z.amax(-1))
+    tile_max, tile_argmax = z.max(-1)
+    new_m = torch.maximum(running_max, tile_max)
     rescale = torch.exp(running_max - new_m)
     e = torch.exp(z - new_m.unsqueeze(-1))
-    sum_exp.mul_(rescale).add_(e.sum(-1))
+    # Keep one maximum's unit mass out of the sum until log1p.
+    new_maximum = running_max < tile_max
+    non_max_e = e.clone()
+    non_max_e.scatter_(
+        1,
+        tile_argmax.unsqueeze(-1),
+        torch.where(new_maximum.unsqueeze(-1), 0.0, e.gather(1, tile_argmax.unsqueeze(-1))),
+    )
+    if HAS_ENTROPY:
+        shift = torch.where(torch.isfinite(running_max), running_max - new_m, 0.0)
+        x_sum_exp.add_((1 + sum_exp) * shift).mul_(rescale).add_((e * (z - new_m.unsqueeze(-1))).sum(-1))
+    sum_exp.mul_(rescale).add_(torch.where(new_maximum, rescale, 0.0)).add_(non_max_e.sum(-1))
     other_e = e.masked_fill(torch.arange(n_cols, device=z.device) == local.unsqueeze(-1), 0.0)
     other_sum_exp.mul_(rescale).add_(other_e.sum(-1))
     if HAS_SUPPORT:
@@ -376,8 +394,6 @@ def _forward_tile(
         score_sum.mul_(rescale_score).add_(torch.where(new_max, rescale_score, 0.0)).add_(se.sum(-1))
         score_argmax.copy_(torch.where(new_max, vocab_start + tile_argmax, score_argmax))
         score_max.copy_(new_sm)
-    if HAS_ENTROPY:
-        x_sum_exp.mul_(rescale).add_((e * z).sum(-1))
     if HAS_LOG_SUM_SQ_PROBS:
         sq_sum_exp.mul_(rescale * rescale).add_((e * e).sum(-1))
     running_max.copy_(new_m)
@@ -390,10 +406,11 @@ def _backward_tile(
     tile,
     tile_stride,
     targets,
+    running_max,
     log_z,
     support_log_z,
     logprobs,
-    entropy,
+    centered_logit,
     grad_logprobs,
     grad_entropy,
     score_max,
@@ -422,7 +439,8 @@ def _backward_tile(
         z = softcap * t * inv_t
     else:
         z = y * inv_t
-    log_p = z - log_z.unsqueeze(-1)
+    shifted = z - running_max.unsqueeze(-1)
+    log_p = shifted - log_z.unsqueeze(-1)
     p = torch.exp(log_p)
 
     grad = torch.zeros_like(z)
@@ -441,8 +459,8 @@ def _backward_tile(
         max_grad = -grad_score_other - grad_score_sum * torch.expm1(-score_log_z)
         grad += torch.where(is_max, max_grad.unsqueeze(-1), -grad_score_sum.unsqueeze(-1) * q)
     if HAS_ENTROPY_GRAD:
-        # d(entropy) / dz_j = -p_j * (log p_j + entropy)
-        grad -= grad_entropy.unsqueeze(-1) * p * (log_p + entropy.unsqueeze(-1))
+        # d(entropy) / dz_j = -p_j * (log p_j + entropy) = -p_j * ((z_j - m) - E[z - m])
+        grad -= grad_entropy.unsqueeze(-1) * p * (shifted - centered_logit.unsqueeze(-1))
     grad = grad * inv_t
     if HAS_SOFTCAP:
         grad = grad * (1 - t * t)
@@ -571,13 +589,14 @@ class ChunkedLogProbFunction(torch.autograd.Function):
                     **kernel_args,
                 )
 
-        log_z = running_max + torch.log(sum_exp)
-        support_log_z = log_z if support_ids is None else running_max + torch.log(support_sum_exp)
+        log_z = torch.log1p(sum_exp)
+        support_log_z = running_max + log_z if support_ids is None else running_max + torch.log(support_sum_exp)
         # Exclude the target before summing: log1p preserves its loss even when its probability rounds to one.
         others = other_sum_exp if support_ids is None else support_other_sum_exp
         logprobs = -torch.nn.functional.softplus((running_max - target_logit) + torch.log(others))
-        entropy = log_z - x_sum_exp / sum_exp if "entropy" in outputs else None
-        log_sum_sq_probs = torch.log(sq_sum_exp) - 2 * torch.log(sum_exp) if "log_sum_sq_probs" in outputs else None
+        centered_logit = x_sum_exp / (1 + sum_exp) if "entropy" in outputs else None
+        entropy = log_z - centered_logit if "entropy" in outputs else None
+        log_sum_sq_probs = torch.log(sq_sum_exp) - 2 * log_z if "log_sum_sq_probs" in outputs else None
         mean_logits = z_sum / vocab if "mean_logits" in outputs else None
         is_top1 = (target_logit >= running_max) & (target_logit > max_before_target) if "is_top1" in outputs else None
         score_log_z = torch.log1p(score_sum) if score_ids is not None else log_z
@@ -593,10 +612,11 @@ class ChunkedLogProbFunction(torch.autograd.Function):
             weight,
             bias,
             targets,
+            running_max,
             log_z,
             support_log_z,
             logprobs.clone(),
-            log_z if entropy is None else entropy,
+            log_z if centered_logit is None else centered_logit,
             support_ids,
             score_ids,
             score_max,
@@ -620,10 +640,11 @@ class ChunkedLogProbFunction(torch.autograd.Function):
             weight,
             bias,
             targets,
+            running_max,
             log_z,
             support_log_z,
             logprobs,
-            entropy,
+            centered_logit,
             support_ids,
             score_ids,
             score_max,
@@ -685,10 +706,11 @@ class ChunkedLogProbFunction(torch.autograd.Function):
                         tile,
                         tile.stride(0),
                         targets[token_start:token_end],
+                        running_max[token_start:token_end],
                         log_z[token_start:token_end],
                         support_log_z[token_start:token_end],
                         logprobs[token_start:token_end],
-                        entropy[token_start:token_end],
+                        centered_logit[token_start:token_end],
                         grad_logprobs[token_start:token_end] if grad_logprobs is not None else log_z,
                         grad_entropy[token_start:token_end] if grad_entropy is not None else log_z,
                         score_max[token_start:token_end],
@@ -705,6 +727,7 @@ class ChunkedLogProbFunction(torch.autograd.Function):
                         HAS_SCORE_GRAD=grad_score is not None,
                         BLOCK_SIZE=_BLOCK_SIZE,
                         **ctx.kernel_args,
+                        **({"enable_fp_fusion": False} if _use_triton(hidden.device) else {}),
                     )
                     if grad_score is not None:
                         tile.scatter_add_(1, local, sparse_grad.to(tile.dtype))

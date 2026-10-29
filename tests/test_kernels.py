@@ -136,6 +136,39 @@ class TestLogProbEntropy:
         assert torch.isfinite(logits.grad).all()
         assert torch.count_nonzero(logits.grad[~row_mask]) == 0
 
+    @pytest.mark.parametrize("temperature", [1.0, 0.7])
+    def test_confident_distribution(self, temperature):
+        vocab_size = 2053
+        targets = torch.tensor([[0, 1024, 2052]], device=torch_device)
+        logits = torch.full((1, 3, vocab_size), -9.0 * temperature, device=torch_device)
+        logits[0, torch.arange(3, device=torch_device), targets[0]] = 20.0 * temperature
+        logits.requires_grad_()
+
+        logprobs, entropy = selective_log_softmax_and_entropy(logits, targets, temperature=temperature)
+        assert (logprobs <= 0).all()
+        assert (entropy > 0).all()
+        (logprobs.sum() + entropy.sum()).backward()
+
+        tail_mass = (vocab_size - 1) * math.exp(-29.0)
+        expected_logp = torch.full((1, 3), -math.log1p(tail_mass), device=torch_device, dtype=torch.float64)
+        expected_entropy = torch.full(
+            (1, 3),
+            math.log1p(tail_mass) + 29.0 * tail_mass / (1 + tail_mass),
+            device=torch_device,
+            dtype=torch.float64,
+        )
+        p_other = math.exp(-29.0) / (1 + tail_mass)
+        p_max = 1.0 / (1 + tail_mass)
+        centered = -29.0 * tail_mass / (1 + tail_mass)
+        grad_other = (-p_other - p_other * (-29.0 - centered)) / temperature
+        grad_max = (tail_mass / (1 + tail_mass) + p_max * centered) / temperature
+        expected_grad = torch.full((1, 3, vocab_size), grad_other, device=torch_device, dtype=torch.float64)
+        expected_grad[0, torch.arange(3, device=torch_device), targets[0]] = grad_max
+
+        torch.testing.assert_close(logprobs.double(), expected_logp, atol=0, rtol=1e-5)
+        torch.testing.assert_close(entropy.double(), expected_entropy, atol=0, rtol=1e-5)
+        torch.testing.assert_close(logits.grad.double(), expected_grad, atol=0, rtol=1e-5)
+
 
 @require_torch_accelerator
 @require_triton
@@ -699,6 +732,31 @@ class TestHeadLossNumerics:
         expected_grad = torch.full((2053, 3), math.exp(-29.0) / (1 + tail_mass), device=device, dtype=torch.float64)
         expected_grad[targets, torch.arange(3, device=device)] = -tail_mass / (1 + tail_mass)
         torch.testing.assert_close(-score_logps.double().sum(), expected_loss, atol=0, rtol=1e-5)
+        torch.testing.assert_close(weight.grad.double(), expected_grad, atol=0, rtol=1e-5)
+
+    @pytest.mark.parametrize("temperature", [1.0, 0.7])
+    @pytest.mark.parametrize("device", ["cpu", torch_device])
+    @pytest.mark.parametrize("chunk_size", [1024, 2053])
+    def test_confident_entropy(self, device, chunk_size, temperature):
+        from trl.kernels.chunked_logprob import ChunkedLogProbFunction
+
+        targets = torch.tensor([0, 1024, 2052], device=device)
+        hidden = torch.eye(3, device=device, requires_grad=True)
+        weight = torch.full((2053, 3), -9.0 * temperature, device=device)
+        weight[targets, torch.arange(3, device=device)] = 20.0 * temperature
+        weight.requires_grad_()
+        _, entropy, *_ = ChunkedLogProbFunction.apply(hidden, weight, None, targets, temperature, chunk_size)
+        entropy.sum().backward()
+
+        tail_mass = 2052 * math.exp(-29.0)
+        centered = -29.0 * tail_mass / (1 + tail_mass)
+        expected_entropy = torch.full((3,), math.log1p(tail_mass) - centered, device=device, dtype=torch.float64)
+        p_other = math.exp(-29.0) / (1 + tail_mass)
+        p_max = 1.0 / (1 + tail_mass)
+        expected_grad = torch.full((2053, 3), -p_other * (-29.0 - centered), device=device, dtype=torch.float64)
+        expected_grad[targets, torch.arange(3, device=device)] = p_max * centered
+        expected_grad /= temperature
+        torch.testing.assert_close(entropy.double(), expected_entropy, atol=0, rtol=1e-5)
         torch.testing.assert_close(weight.grad.double(), expected_grad, atol=0, rtol=1e-5)
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
