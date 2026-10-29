@@ -1406,9 +1406,11 @@ class DPOTrainer(_BaseTrainer):
             chosen_scores = chosen_logratios
             rejected_scores = rejected_logratios
         elif self.f_divergence_type == "forward_kl":
-            # f'(t) = 1 - 1/t
-            chosen_scores = 1 - torch.exp(-chosen_logratios)
-            rejected_scores = 1 - torch.exp(-rejected_logratios)
+            # f'(t) = 1 - 1/t; clamp max so exp(.) does not overflow
+            dtype = chosen_logratios.dtype
+            clamp_max = {torch.float16: 11.0, torch.bfloat16: 80.0, torch.float32: 80.0}[dtype]
+            chosen_scores = 1 - torch.exp(torch.clamp(-chosen_logratios.float(), max=clamp_max)).to(dtype)
+            rejected_scores = 1 - torch.exp(torch.clamp(-rejected_logratios.float(), max=clamp_max)).to(dtype)
         elif self.f_divergence_type == "js_divergence":
             # f'(t) = log(2t/(t+1)) = log 2 + logsigmoid(log t)
             chosen_scores = math.log(2) + F.logsigmoid(chosen_logratios)
