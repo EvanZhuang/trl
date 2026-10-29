@@ -601,6 +601,32 @@ class TestDPOTrainer(TrlTestCase):
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
+    def test_train_with_forward_kl_and_large_negative_log_ratio(self):
+        # The rejected completion's log-ratio (about -146) is below -88.72, where float32 exp(-log_ratio) overflows.
+        # This pair's loss is ~0 and its gradient must stay finite, so training must not write NaN into the weights.
+        dataset = Dataset.from_dict(
+            {
+                "prompt": ["Is the sky blue?"],
+                "chosen": [" Yes."],
+                "rejected": [" No, the sky is green and the grass is purple, and that is all I know."],
+            }
+        )
+        model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype="float32")
+        ref_model = AutoModelForCausalLM.from_pretrained(model_id, dtype="float32")
+        with torch.no_grad():
+            model.lm_head.weight.mul_(450.0)
+            ref_model.lm_head.weight.zero_()
+        training_args = DPOConfig(
+            output_dir=self.tmp_dir, f_divergence_type="forward_kl", per_device_train_batch_size=1, report_to="none"
+        )
+        trainer = DPOTrainer(model=model, ref_model=ref_model, args=training_args, train_dataset=dataset)
+
+        trainer.train()
+
+        for n, param in trainer.model.named_parameters():
+            assert torch.isfinite(param).all(), f"Parameter {n} is not finite."
+
     @pytest.mark.parametrize("loss_type", ["apo_zero", "apo_down", "aot", "aot_unpaired", "nca_pair", "sppo_hard"])
     def test_init_fails_with_f_divergence_and_unsupported_loss(self, loss_type):
         dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
